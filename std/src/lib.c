@@ -24,6 +24,7 @@
 #cust mod rc;
 #cust mod arc;
 #cust mod list;
+#cust mod hashmap;
 
 #cust use crate::types;
 
