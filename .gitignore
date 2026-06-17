@@ -1,3 +1,9 @@
+# cust toolchain (installed via `just install-cust`)
+/.cust/
+
+.vscode
+/target
+
 # Prerequisites
 *.d
 
