@@ -35,12 +35,30 @@
 
 #include <stddef.h>
 
+/* ─── park hook ─────────────────────────────────────────── */
+
+/* The executor's single extension point. When the ready queue
+ * empties but tasks are still live, the executor calls `park`
+ * to wait for an *external* event source (a timer reactor, an
+ * I/O driver, a cross-thread channel) to fire wakers. It must
+ * return true if it queued at least one task — false means it
+ * could make no progress, so the executor stops (a stall /
+ * deadlock). A `{NULL, NULL}` park is pure-compute mode: the
+ * executor stops as soon as nothing is runnable. The hook is
+ * deliberately timer-agnostic so the same executor drives
+ * timers, I/O, and a fake test clock without change. */
+struct [[cust::pub_repr]] cexec_park {
+    bool (*park)(void *state);
+    void  *state;
+};
+
 /* ─── executor handle ───────────────────────────────────── */
 
 struct [[cust::pub_repr]] cexec_executor {
     struct cstd_alloc    alloc;
     struct std_list_head ready; /* intrusive queue of runnable tasks */
     usize                live;  /* tasks not yet completed */
+    struct cexec_park    park;  /* external wake source ({NULL,NULL}=none) */
 };
 
 [[cust::pub]] void cexec_executor_init(struct cexec_executor *ex,
@@ -48,6 +66,15 @@ struct [[cust::pub_repr]] cexec_executor {
     ex->alloc = a;
     std_list_init(&ex->ready);
     ex->live = 0;
+    ex->park.park  = (void *)0;
+    ex->park.state = (void *)0;
+}
+
+/* Install the external wake source driven when the executor
+ * goes idle with work still outstanding. */
+[[cust::pub]] void cexec_executor_set_park(struct cexec_executor *ex,
+                                           struct cexec_park park) {
+    ex->park = park;
 }
 
 [[cust::pub]] usize cexec_executor_live(const struct cexec_executor *ex) {
@@ -139,38 +166,54 @@ static struct task *executor_push(struct cexec_executor *ex,
     return false;
 }
 
-/* Drain the ready queue: poll each runnable task once, freeing
- * it on completion and leaving Pending tasks parked until a
- * waker re-enqueues them. Returns when nothing is runnable. */
+/* Drain runnable tasks, then park on the external wake source
+ * when the queue empties, until no progress can be made. With
+ * no parker installed this stops as soon as nothing is runnable
+ * (pure-compute mode); with one it blocks for timers / I/O and
+ * resumes when they fire wakers. */
 static void executor_drive(struct cexec_executor *ex) {
-    while (!std_list_is_empty(&ex->ready)) {
-        struct std_list_head *node = ex->ready.next;
-        struct task *t = TASK_OF(node);
-        std_list_del(node);
-        t->queued = false;
+    for (;;) {
+        while (!std_list_is_empty(&ex->ready)) {
+            struct std_list_head *node = ex->ready.next;
+            struct task *t = TASK_OF(node);
+            std_list_del(node);
+            t->queued = false;
 
-        struct cexec_waker w = task_waker(t);
-        cexec_poll st = cexec_future_poll(t->fut, w, t->out);
+            struct cexec_waker w = task_waker(t);
+            cexec_poll st = cexec_future_poll(t->fut, w, t->out);
 
-        if (cexec_poll_is_ready(st)) {
-            /* A future may wake its own task mid-poll (e.g. one
-             * arm of a select) and still complete via a sibling
-             * in the same poll. That re-queues this task, so
-             * unlink it before freeing or the next iteration
-             * would pop freed memory. */
-            if (t->queued) {
-                std_list_del(&t->link);
-                t->queued = false;
+            if (cexec_poll_is_ready(st)) {
+                /* A future may wake its own task mid-poll (e.g.
+                 * one arm of a select) and still complete via a
+                 * sibling in the same poll. That re-queues this
+                 * task, so unlink it before freeing or the next
+                 * iteration would pop freed memory. */
+                if (t->queued) {
+                    std_list_del(&t->link);
+                    t->queued = false;
+                }
+                if (t->done) {
+                    *t->done = true;
+                }
+                cexec_future_drop(t->fut);
+                ex->live--;
+                cstd_alloc_deallocate(ex->alloc, t, sizeof *t,
+                                      _Alignof(struct task));
             }
-            if (t->done) {
-                *t->done = true;
-            }
-            cexec_future_drop(t->fut);
-            ex->live--;
-            cstd_alloc_deallocate(ex->alloc, t, sizeof *t,
-                                  _Alignof(struct task));
+            /* else: Pending — parked until its waker re-queues it. */
         }
-        /* else: Pending — parked until its waker re-queues it. */
+
+        /* Ready queue drained. */
+        if (ex->live == 0) {
+            return; /* everything finished */
+        }
+        if (!ex->park.park) {
+            return; /* no wake source: nothing can re-queue a task */
+        }
+        if (!ex->park.park(ex->park.state)) {
+            return; /* parker made no progress: stalled */
+        }
+        /* parker fired ≥1 waker → loop and drain the new work */
     }
 }
 

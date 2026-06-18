@@ -15,6 +15,10 @@
  *                     run, block_on
  *   src/combinators.c — map / then / join2 / select2:
  *                     compose futures into trees
+ *   src/reactor.c   — cexec_reactor: timer wake source + sleep
+ *                     future + mockable clock (a `park` impl)
+ *   src/runtime.c   — cexec_runtime: executor + reactor bundled
+ *                     (the batteries-included default)
  *
  * What's here vs. Rust:
  *   - poll + waker + future + executor: faithful.
@@ -31,6 +35,8 @@
 #cust mod future;
 #cust mod executor;
 #cust mod combinators;
+#cust mod reactor;
+#cust mod runtime;
 
 /* The cust_execution major/minor/patch this crate was authored
  * against. */
