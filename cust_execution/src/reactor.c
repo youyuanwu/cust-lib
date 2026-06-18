@@ -169,6 +169,38 @@ struct [[cust::pub_repr]] cexec_reactor {
     return std_list_is_empty(&r->pending);
 }
 
+/* Report the earliest pending deadline. Returns false (and
+ * leaves *deadline_out untouched) if no timers are pending.
+ * Lets an external parker — e.g. an epoll driver — use the next
+ * timer as its blocking timeout. */
+[[cust::pub]] bool cexec_reactor_earliest(const struct cexec_reactor *r,
+                                          u64 *deadline_out) {
+    if (std_list_is_empty(&r->pending)) {
+        return false;
+    }
+    *deadline_out = TIMER_OF(r->pending.next)->deadline;
+    return true;
+}
+
+/* Fire every timer whose deadline is <= `now`, waking its task
+ * and consuming its waker clone. Returns true if any fired. The
+ * caller supplies `now` so a single clock read can be shared
+ * with other work (e.g. after an epoll_wait). */
+[[cust::pub]] bool cexec_reactor_fire_due(struct cexec_reactor *r, u64 now) {
+    bool progressed = false;
+    while (!std_list_is_empty(&r->pending)) {
+        struct cexec_timer *t = TIMER_OF(r->pending.next);
+        if (t->deadline > now) {
+            break; /* the rest are still in the future */
+        }
+        std_list_del(&t->link);
+        t->fired = true;
+        cexec_waker_wake(t->waker); /* consumes the cloned waker */
+        progressed = true;
+    }
+    return progressed;
+}
+
 /* Insert `t` keeping `pending` sorted by ascending deadline, so
  * the front is always the next timer to fire. */
 static void reactor_insert(struct cexec_reactor *r, struct cexec_timer *t) {
@@ -188,26 +220,12 @@ static void reactor_insert(struct cexec_reactor *r, struct cexec_timer *t) {
  * true if it woke ≥1 task. */
 static bool reactor_park(void *state) {
     struct cexec_reactor *r = state;
-    if (std_list_is_empty(&r->pending)) {
+    u64 deadline;
+    if (!cexec_reactor_earliest(r, &deadline)) {
         return false; /* nothing to wait for */
     }
-
-    struct cexec_timer *first = TIMER_OF(r->pending.next);
-    r->clock.vtable->wait_until(r->clock.state, first->deadline);
-
-    u64 now = r->clock.vtable->now(r->clock.state);
-    bool progressed = false;
-    while (!std_list_is_empty(&r->pending)) {
-        struct cexec_timer *t = TIMER_OF(r->pending.next);
-        if (t->deadline > now) {
-            break; /* the rest are still in the future */
-        }
-        std_list_del(&t->link);
-        t->fired = true;
-        cexec_waker_wake(t->waker); /* consumes the cloned waker */
-        progressed = true;
-    }
-    return progressed;
+    r->clock.vtable->wait_until(r->clock.state, deadline);
+    return cexec_reactor_fire_due(r, r->clock.vtable->now(r->clock.state));
 }
 
 [[cust::pub]] struct cexec_park cexec_reactor_as_park(struct cexec_reactor *r) {

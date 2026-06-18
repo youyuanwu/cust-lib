@@ -17,6 +17,9 @@
  *                     compose futures into trees
  *   src/reactor.c   — cexec_reactor: timer wake source + sleep
  *                     future + mockable clock (a `park` impl)
+ *   src/io.c        — cexec_io_driver: epoll readiness driver +
+ *                     readable future; unifies timers + I/O in
+ *                     one epoll_wait (a `park` impl)
  *   src/runtime.c   — cexec_runtime: executor + reactor bundled
  *                     (the batteries-included default)
  *
@@ -36,6 +39,7 @@
 #cust mod executor;
 #cust mod combinators;
 #cust mod reactor;
+#cust mod io;
 #cust mod runtime;
 
 /* The cust_execution major/minor/patch this crate was authored
