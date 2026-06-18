@@ -1,2 +1,2 @@
 [workspace]
-members = ["hello", "std"]
+members = ["hello", "std", "cust_execution"]

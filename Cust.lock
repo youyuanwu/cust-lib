@@ -5,6 +5,12 @@
 lock_format_version = 1
 
 [[member]]
+name = "cust_execution"
+version = "0.1.0"
+path = "cust_execution"
+dependencies = ["std"]
+
+[[member]]
 name = "hello"
 version = "0.1.0"
 path = "hello"
