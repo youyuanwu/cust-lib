@@ -13,10 +13,14 @@
  *
  * Reaches the crate only through its public surface
  * (`#cust use cust_execution;`), the way a downstream consumer
- * would. The server/client are hand-written multi-step state
- * machine futures (the manual form of an async fn) because the
- * `then` combinator discards its first future's output and so
- * can't thread the accepted/connected stream forward.
+ * would. The server and client are expressed with the
+ * `cexec_sm` state-machine combinator: each is a flat table of
+ * state functions over a caller-owned context struct (here, a
+ * plain stack local in the test), so the suspend/resume
+ * plumbing lives in the combinator, not hand-rolled here. The
+ * server uses no-I/O decision states for its accept-ok and
+ * EOF branches; both sides thread their stream/buffer/count
+ * through the context across suspends.
  */
 
 #cust use std;
@@ -25,112 +29,63 @@
 #include <string.h>
 
 /* ─── server: accept → read → echo ──────────────────────── */
+/* states: accept, check-accept (branch), read, check-read
+ * (EOF branch), echo. The two no-I/O "check" states are the
+ * if/else nodes; the rest await real socket readiness. */
 
-struct server_fut {
+struct echo_ctx {
     struct cstd_alloc      a;
     struct cexec_listener *lis;
     struct cexec_stream    stream;
     bool                   have_stream;
     char                   buf[64];
     isize                  n;
-    u8                     stage; /* 0 accept, 1 read, 2 write, 3 done */
-    struct cexec_future    sub;
-    bool                   have_sub;
 };
 
-static cexec_poll server_poll(void *self, struct cexec_waker w, void *out) {
-    (void)out;
-    struct server_fut *s = self;
-    for (;;) {
-        if (s->stage == 0) {
-            if (!s->have_sub) {
-                s->sub = cexec_listener_accept(s->a, s->lis);
-                s->have_sub = true;
-            }
-            if (!cexec_poll_is_ready(cexec_future_poll(s->sub, w, &s->stream))) {
-                return cexec_poll_pending();
-            }
-            cexec_future_drop(s->sub);
-            s->have_sub = false;
-            s->have_stream = cexec_stream_is_open(&s->stream);
-            if (!s->have_stream) {
-                return cexec_poll_ready();
-            }
-            s->stage = 1;
-            continue;
-        }
-        if (s->stage == 1) {
-            if (!s->have_sub) {
-                s->sub = cexec_stream_read(s->a, &s->stream, s->buf, sizeof s->buf);
-                s->have_sub = true;
-            }
-            if (!cexec_poll_is_ready(cexec_future_poll(s->sub, w, &s->n))) {
-                return cexec_poll_pending();
-            }
-            cexec_future_drop(s->sub);
-            s->have_sub = false;
-            if (s->n <= 0) {
-                return cexec_poll_ready();
-            }
-            s->stage = 2;
-            continue;
-        }
-        if (s->stage == 2) {
-            if (!s->have_sub) {
-                s->sub = cexec_stream_write_all(s->a, &s->stream, s->buf,
-                                                (usize)s->n);
-                s->have_sub = true;
-            }
-            if (!cexec_poll_is_ready(cexec_future_poll(s->sub, w, (void *)0))) {
-                return cexec_poll_pending();
-            }
-            cexec_future_drop(s->sub);
-            s->have_sub = false;
-            s->stage = 3;
-            return cexec_poll_ready();
-        }
-        return cexec_poll_ready();
-    }
+enum { SV_ACCEPT, SV_AFTER_ACCEPT, SV_READ, SV_AFTER_READ, SV_ECHO };
+
+static struct cexec_step sv_accept(void *p) {
+    struct echo_ctx *c = p;
+    return (struct cexec_step){
+        cexec_listener_accept(c->a, c->lis), &c->stream, SV_AFTER_ACCEPT };
 }
 
-static void server_drop(void *self) {
-    struct server_fut *s = self;
-    if (s->have_sub) {
-        cexec_future_drop(s->sub);
-    }
-    if (s->have_stream) {
-        cexec_stream_close(&s->stream);
-    }
-    cstd_alloc_deallocate(s->a, s, sizeof *s, _Alignof(struct server_fut));
+static struct cexec_step sv_after_accept(void *p) {
+    struct echo_ctx *c = p;
+    c->have_stream = cexec_stream_is_open(&c->stream);
+    return (struct cexec_step){
+        cexec_future_null(), (void *)0,
+        c->have_stream ? SV_READ : cexec_sm_done() };
 }
 
-static const struct cexec_future_vtable server_vtable = {
-    .poll = server_poll,
-    .drop = server_drop,
+static struct cexec_step sv_read(void *p) {
+    struct echo_ctx *c = p;
+    return (struct cexec_step){
+        cexec_stream_read(c->a, &c->stream, c->buf, sizeof c->buf),
+        &c->n, SV_AFTER_READ };
+}
+
+static struct cexec_step sv_after_read(void *p) {
+    struct echo_ctx *c = p;
+    return (struct cexec_step){
+        cexec_future_null(), (void *)0,
+        (c->n > 0) ? SV_ECHO : cexec_sm_done() }; /* EOF/err -> stop */
+}
+
+static struct cexec_step sv_echo(void *p) {
+    struct echo_ctx *c = p;
+    return (struct cexec_step){
+        cexec_stream_write_all(c->a, &c->stream, c->buf, (usize)c->n),
+        (void *)0, cexec_sm_done() };
+}
+
+static const cexec_state_fn server_states[] = {
+    sv_accept, sv_after_accept, sv_read, sv_after_read, sv_echo,
 };
-
-static struct cexec_future server_future(struct cstd_alloc a,
-                                         struct cexec_listener *lis) {
-    struct cexec_future f = {(void *)0, (void *)0};
-    struct server_fut *s = cstd_alloc_allocate(a, sizeof *s,
-                                               _Alignof(struct server_fut));
-    if (!s) {
-        return f;
-    }
-    s->a           = a;
-    s->lis         = lis;
-    s->have_stream = false;
-    s->n           = 0;
-    s->stage       = 0;
-    s->have_sub    = false;
-    f.self         = s;
-    f.vtable       = &server_vtable;
-    return f;
-}
 
 /* ─── client: connect → write → read + verify ───────────── */
 
-struct client_fut {
+struct echo_client_ctx {
     struct cstd_alloc       a;
     struct cexec_io_driver *io;
     u16                     port;
@@ -139,101 +94,52 @@ struct client_fut {
     bool                    have_stream;
     char                    buf[64];
     isize                   n;
-    u8                      stage; /* 0 connect, 1 write, 2 read, 3 done */
-    struct cexec_future     sub;
-    bool                    have_sub;
 };
 
-static cexec_poll client_poll(void *self, struct cexec_waker w, void *out) {
-    (void)out;
-    struct client_fut *c = self;
-    for (;;) {
-        if (c->stage == 0) {
-            if (!c->have_sub) {
-                c->sub = cexec_tcp_connect(c->a, c->io, "127.0.0.1", c->port);
-                c->have_sub = true;
-            }
-            if (!cexec_poll_is_ready(cexec_future_poll(c->sub, w, &c->stream))) {
-                return cexec_poll_pending();
-            }
-            cexec_future_drop(c->sub);
-            c->have_sub = false;
-            c->have_stream = cexec_stream_is_open(&c->stream);
-            if (!c->have_stream) {
-                *c->ok = 0;
-                return cexec_poll_ready();
-            }
-            c->stage = 1;
-            continue;
-        }
-        if (c->stage == 1) {
-            if (!c->have_sub) {
-                c->sub = cexec_stream_write_all(c->a, &c->stream, "ping", 4);
-                c->have_sub = true;
-            }
-            if (!cexec_poll_is_ready(cexec_future_poll(c->sub, w, (void *)0))) {
-                return cexec_poll_pending();
-            }
-            cexec_future_drop(c->sub);
-            c->have_sub = false;
-            c->stage = 2;
-            continue;
-        }
-        if (c->stage == 2) {
-            if (!c->have_sub) {
-                c->sub = cexec_stream_read(c->a, &c->stream, c->buf, sizeof c->buf);
-                c->have_sub = true;
-            }
-            if (!cexec_poll_is_ready(cexec_future_poll(c->sub, w, &c->n))) {
-                return cexec_poll_pending();
-            }
-            cexec_future_drop(c->sub);
-            c->have_sub = false;
-            *c->ok = (c->n == 4 && memcmp(c->buf, "ping", 4) == 0) ? 1 : 0;
-            c->stage = 3;
-            return cexec_poll_ready();
-        }
-        return cexec_poll_ready();
-    }
+enum { CL_CONNECT, CL_AFTER_CONNECT, CL_WRITE, CL_READ, CL_VERIFY };
+
+static struct cexec_step cl_connect(void *p) {
+    struct echo_client_ctx *c = p;
+    return (struct cexec_step){
+        cexec_tcp_connect(c->a, c->io, "127.0.0.1", c->port),
+        &c->stream, CL_AFTER_CONNECT };
 }
 
-static void client_drop(void *self) {
-    struct client_fut *c = self;
-    if (c->have_sub) {
-        cexec_future_drop(c->sub);
+static struct cexec_step cl_after_connect(void *p) {
+    struct echo_client_ctx *c = p;
+    c->have_stream = cexec_stream_is_open(&c->stream);
+    if (!c->have_stream) {
+        *c->ok = 0;
+        return (struct cexec_step){ cexec_future_null(), (void *)0,
+                                    cexec_sm_done() };
     }
-    if (c->have_stream) {
-        cexec_stream_close(&c->stream);
-    }
-    cstd_alloc_deallocate(c->a, c, sizeof *c, _Alignof(struct client_fut));
+    return (struct cexec_step){ cexec_future_null(), (void *)0, CL_WRITE };
 }
 
-static const struct cexec_future_vtable client_vtable = {
-    .poll = client_poll,
-    .drop = client_drop,
+static struct cexec_step cl_write(void *p) {
+    struct echo_client_ctx *c = p;
+    return (struct cexec_step){
+        cexec_stream_write_all(c->a, &c->stream, "ping", 4),
+        (void *)0, CL_READ };
+}
+
+static struct cexec_step cl_read(void *p) {
+    struct echo_client_ctx *c = p;
+    return (struct cexec_step){
+        cexec_stream_read(c->a, &c->stream, c->buf, sizeof c->buf),
+        &c->n, CL_VERIFY };
+}
+
+static struct cexec_step cl_verify(void *p) {
+    struct echo_client_ctx *c = p;
+    *c->ok = (c->n == 4 && memcmp(c->buf, "ping", 4) == 0) ? 1 : 0;
+    return (struct cexec_step){ cexec_future_null(), (void *)0,
+                                cexec_sm_done() };
+}
+
+static const cexec_state_fn client_states[] = {
+    cl_connect, cl_after_connect, cl_write, cl_read, cl_verify,
 };
-
-static struct cexec_future client_future(struct cstd_alloc a,
-                                         struct cexec_io_driver *io,
-                                         u16 port, i32 *ok) {
-    struct cexec_future f = {(void *)0, (void *)0};
-    struct client_fut *c = cstd_alloc_allocate(a, sizeof *c,
-                                               _Alignof(struct client_fut));
-    if (!c) {
-        return f;
-    }
-    c->a           = a;
-    c->io          = io;
-    c->port        = port;
-    c->ok          = ok;
-    c->have_stream = false;
-    c->n           = 0;
-    c->stage       = 0;
-    c->have_sub    = false;
-    f.self         = c;
-    f.vtable       = &client_vtable;
-    return f;
-}
 
 /* ─── the test ──────────────────────────────────────────── */
 
@@ -250,19 +156,36 @@ static struct cexec_future client_future(struct cstd_alloc a,
     u16 port = cexec_tcp_local_port(&lis);
     cust_assert(port != 0);
 
+    /* The contexts are plain stack locals: block_on drives the
+     * machines to completion synchronously, so they outlive the
+     * run and we clean up their streams afterward. */
+    i32 ok = 0;
+    struct echo_ctx sv = {
+        .a = a, .lis = &lis, .have_stream = false, .n = 0,
+    };
+    struct echo_client_ctx cl = {
+        .a = a, .io = &io, .port = port, .ok = &ok,
+        .have_stream = false, .n = 0,
+    };
+
     /* One block_on drives server + client concurrently. The
      * server's accept is polled first and must Pend until the
      * client's concurrent connect arrives — exercising the real
      * async suspend/resume path. */
-    i32 ok = 0;
-    struct cexec_future f =
-        cexec_join2_in(a, server_future(a, &lis), 0,
-                       client_future(a, &io, port, &ok));
+    struct cexec_future f = cexec_join2_in(
+        a, cexec_sm_in(a, &sv, server_states, 5, SV_ACCEPT), 0,
+        cexec_sm_in(a, &cl, client_states, 5, CL_CONNECT));
     bool done = cexec_executor_block_on(&ex, f, (void *)0);
 
     cust_assert(done);
     cust_assert_eq((i32)ok, (i32)1);
 
+    if (sv.have_stream) {
+        cexec_stream_close(&sv.stream);
+    }
+    if (cl.have_stream) {
+        cexec_stream_close(&cl.stream);
+    }
     cexec_listener_close(&lis);
     cexec_io_driver_close(&io);
     return 0;

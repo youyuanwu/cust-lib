@@ -13,8 +13,9 @@
  *                     vtables + leaf futures (ready, yield_now)
  *   src/executor.c  — cexec_executor: ready queue, spawn,
  *                     run, block_on
- *   src/combinators.c — map / then / join2 / select2:
- *                     compose futures into trees
+ *   src/combinators.c — map / then / join2 / select2 + sm
+ *                     (state machine): compose futures into
+ *                     trees and control-flow graphs
  *   src/reactor.c   — cexec_reactor: timer wake source + sleep
  *                     future + mockable clock (a `park` impl)
  *   src/io.c        — cexec_io_driver: epoll readiness driver +

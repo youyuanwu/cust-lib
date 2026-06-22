@@ -116,6 +116,15 @@ struct [[cust::pub_repr]] cexec_future_vtable {
     return f.vtable == (void *)0;
 }
 
+/* The null future {NULL, NULL}: the OOM sentinel returned by
+ * leaf/combinator constructors, and the "no work" marker some
+ * combinators (e.g. the state machine's pure-branch nodes)
+ * use. Never poll it; `cexec_future_drop` on it is a no-op. */
+[[cust::pub]] struct cexec_future cexec_future_null(void) {
+    struct cexec_future f = {(void *)0, (void *)0};
+    return f;
+}
+
 /* ─── Leaf future: ready(value) ─────────────────────────── */
 
 /* Immediately-Ready future carrying `size` bytes of payload

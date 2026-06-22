@@ -14,6 +14,8 @@
  *   a.then(|_| b) / a; b        cexec_then_in   (sequential)
  *   join(a, b)                  cexec_join2_in  (wait for both)
  *   select(a, b)                cexec_select2_in(first to finish)
+ *   async fn { ... }            cexec_sm_in     (state-machine:
+ *                                                sequence/if/loop)
  *
  * Three layers, one `cexec_future` type throughout:
  *
@@ -295,7 +297,141 @@ static const struct cexec_future_vtable select_vtable = {
     f.vtable = &select_vtable;
     return f;
 }
+/* ─── sm: data-driven state machine (sequence / if / loop) ─ */
 
+/* The stackless, macro-free answer to `async fn` control flow.
+ * Where `then`/`map` only express a straight line, a state
+ * machine expresses an arbitrary control-flow *graph*: each
+ * state names its own successor, so plain C `if`s over a user-
+ * owned context produce sequence, branch, and loop.
+ *
+ *   construct   how
+ *   ---------   ------------------------------------------
+ *   sequence    state returns next = the following index
+ *   if / else   a no-I/O state returns one of two indices
+ *   loop        a state returns a back-edge to an earlier one
+ *   return      a state returns next = cexec_sm_done()
+ *
+ * The caller allocates and owns the *context* struct holding
+ * every value that must live across a suspend (the cross-state
+ * locals). Each state is an ordinary function that reads prior
+ * results from the context, builds the next future, and says
+ * (a) where that future's Ready output should land in the
+ * context and (b) which state to run next. The driver below
+ * owns only the poll/Pending/drop/advance plumbing — written
+ * once here instead of by hand in every multi-step future.
+ *
+ * Output: the machine itself is a unit future (it produces no
+ * aggregate value through `out` — results accumulate in the
+ * caller's context), so `block_on(sm, NULL)`.
+ *
+ * Ownership: the machine owns each in-flight child future (it
+ * drops it on completion or in its own drop) but NOT the
+ * context, nor the `states` array — both outlive the machine
+ * and are released by the caller. */
+
+/* A no-I/O transition: `fut` is the null future, so the driver
+ * runs no await and jumps straight to `next`. Used for pure
+ * branch/decision states and for states whose only effect is
+ * computing on the context. */
+
+/* One state's decision: the future to await (or the null future
+ * for a no-I/O transition), where its output lands in the
+ * context, and the state to run once it completes. */
+struct [[cust::pub_repr]] cexec_step {
+    struct cexec_future fut;  /* null => no await, just go to `next` */
+    void               *out;  /* where fut's output lands (in ctx), or NULL */
+    u32                 next; /* state to run after fut; cexec_sm_done() ends */
+};
+
+/* A state function: given the caller's context, decide the next
+ * step. Runs at the *start* of the state, so any prior state's
+ * output is already in the context and available to branch on. */
+[[cust::pub]] typedef struct cexec_step (*cexec_state_fn)(void *ctx);
+
+/* The terminal "state": returning this as a step's `next` ends
+ * the machine. Any index >= the state count also terminates. */
+[[cust::pub]] u32 cexec_sm_done(void) { return 0xFFFFFFFFu; }
+
+struct sm_box {
+    struct cstd_alloc     alloc;
+    void                 *ctx;     /* caller-owned cross-state locals */
+    const cexec_state_fn *states;  /* caller-owned, length `nstates`  */
+    usize                 nstates;
+    u32                   state;   /* index of the state to (re)enter */
+    struct cexec_future   cur;     /* in-flight child future          */
+    void                 *cur_out; /* where cur's output lands         */
+    u32                   cur_next;/* state to enter once cur is Ready */
+    bool                  have_cur;/* cur built and not yet finished   */
+};
+
+static cexec_poll sm_poll(void *self, struct cexec_waker w, void *out) {
+    (void)out; /* results live in the caller's context, not in `out` */
+    struct sm_box *m = self;
+    for (;;) {
+        if (m->state >= m->nstates) { /* covers cexec_sm_done() */
+            return cexec_poll_ready();
+        }
+        if (!m->have_cur) {
+            struct cexec_step step = m->states[m->state](m->ctx);
+            m->cur      = step.fut;
+            m->cur_out  = step.out;
+            m->cur_next = step.next;
+            m->have_cur = true;
+        }
+        if (cexec_future_is_null(m->cur)) {
+            /* no-I/O state: take the edge immediately, no poll */
+            m->have_cur = false;
+            m->state    = m->cur_next;
+            continue;
+        }
+        if (!cexec_poll_is_ready(cexec_future_poll(m->cur, w, m->cur_out))) {
+            return cexec_poll_pending();
+        }
+        cexec_future_drop(m->cur);
+        m->have_cur = false;
+        m->state    = m->cur_next;
+        /* drive across the transition in this same wake-up */
+    }
+}
+
+static void sm_drop(void *self) {
+    struct sm_box *m = self;
+    if (m->have_cur && !cexec_future_is_null(m->cur)) {
+        cexec_future_drop(m->cur);
+    }
+    cstd_alloc_deallocate(m->alloc, m, sizeof *m, _Alignof(struct sm_box));
+}
+
+static const struct cexec_future_vtable sm_vtable = {
+    .poll = sm_poll,
+    .drop = sm_drop,
+};
+
+/* Run a state machine over `states` (length `nstates`), beginning
+ * at `start`, threading results through the caller-owned `ctx`.
+ * The machine does not own `ctx` or `states`; both must outlive
+ * the returned future. Returns the null future on OOM. */
+[[cust::pub]] struct cexec_future cexec_sm_in(struct cstd_alloc a, void *ctx,
+                                              const cexec_state_fn *states,
+                                              usize nstates, u32 start) {
+    struct cexec_future f = {(void *)0, (void *)0};
+    struct sm_box *m = cstd_alloc_allocate(a, sizeof *m, _Alignof(struct sm_box));
+    if (!m) {
+        return f;
+    }
+    m->alloc    = a;
+    m->ctx      = ctx;
+    m->states   = states;
+    m->nstates  = nstates;
+    m->state    = start;
+    m->cur_out  = (void *)0;
+    m->cur_next = 0;
+    m->have_cur = false;
+    f.self      = m;
+    f.vtable    = &sm_vtable;
+    return f;
+}
 /* ─── unit tests ────────────────────────────────────────── */
 
 /* A leaf that pends once (waking itself), then yields an i32 —
@@ -434,5 +570,116 @@ static void map_double(void *out) { *(i32 *)out *= 2; }
     struct cexec_future f = cexec_map_in(a, inner, map_double);
     cust_assert(cexec_executor_block_on(&ex, f, &out));
     cust_assert_eq(out, 42);
+    return 0;
+}
+
+/* ─── state-machine tests: sequence / if-else / loop ────── */
+
+/* sequence: await x, await y, then compute sum in a no-I/O
+ * state — outputs threaded through the caller-owned context. */
+struct seq_ctx { struct cstd_alloc a; i32 x, y, sum; };
+enum { Q_X, Q_Y, Q_SUM };
+
+static struct cexec_step q_x(void *p) {
+    struct seq_ctx *c = p;
+    return (struct cexec_step){ dv_future(c->a, 3), &c->x, Q_Y };
+}
+static struct cexec_step q_y(void *p) {
+    struct seq_ctx *c = p;
+    return (struct cexec_step){ dv_future(c->a, 4), &c->y, Q_SUM };
+}
+static struct cexec_step q_sum(void *p) {
+    struct seq_ctx *c = p;
+    c->sum = c->x + c->y; /* both outputs are now in the context */
+    return (struct cexec_step){ cexec_future_null(), (void *)0, cexec_sm_done() };
+}
+static const cexec_state_fn seq_states[] = { q_x, q_y, q_sum };
+
+[[cust::test]] int test_sm_sequence(void) {
+    struct cstd_alloc a = cstd_alloc_system();
+    struct cexec_executor ex;
+    cexec_executor_init(&ex, a);
+
+    struct seq_ctx c = { a, 0, 0, 0 };
+    struct cexec_future f = cexec_sm_in(a, &c, seq_states, 3, Q_X);
+    cust_assert(cexec_executor_block_on(&ex, f, (void *)0));
+    cust_assert_eq(c.sum, 7);
+    return 0;
+}
+
+/* if/else: await a value, then a no-I/O decision state forks to
+ * one of two terminal states by an ordinary C `if`. */
+struct br_ctx { struct cstd_alloc a; i32 n, result; };
+enum { B_LOAD, B_DECIDE, B_POS, B_NEG };
+
+static struct cexec_step b_load(void *p) {
+    struct br_ctx *c = p;
+    return (struct cexec_step){ dv_future(c->a, c->n), &c->n, B_DECIDE };
+}
+static struct cexec_step b_decide(void *p) {
+    struct br_ctx *c = p;
+    u32 next = (c->n > 0) ? B_POS : B_NEG; /* the branch */
+    return (struct cexec_step){ cexec_future_null(), (void *)0, next };
+}
+static struct cexec_step b_pos(void *p) {
+    struct br_ctx *c = p;
+    c->result = 1;
+    return (struct cexec_step){ cexec_future_null(), (void *)0, cexec_sm_done() };
+}
+static struct cexec_step b_neg(void *p) {
+    struct br_ctx *c = p;
+    c->result = 2;
+    return (struct cexec_step){ cexec_future_null(), (void *)0, cexec_sm_done() };
+}
+static const cexec_state_fn br_states[] = { b_load, b_decide, b_pos, b_neg };
+
+static i32 run_branch(struct cstd_alloc a, i32 input) {
+    struct cexec_executor ex;
+    cexec_executor_init(&ex, a);
+    struct br_ctx c = { a, input, 0 };
+    cexec_executor_block_on(&ex, cexec_sm_in(a, &c, br_states, 4, B_LOAD),
+                            (void *)0);
+    return c.result;
+}
+
+[[cust::test]] int test_sm_if_else(void) {
+    struct cstd_alloc a = cstd_alloc_system();
+    cust_assert_eq(run_branch(a, 5), 1);  /* positive -> B_POS */
+    cust_assert_eq(run_branch(a, -2), 2); /* else     -> B_NEG */
+    return 0;
+}
+
+/* loop: sum 1..=N by a back-edge. L_CHECK is the loop head
+ * (continue or exit); L_LOAD awaits the next addend; L_ADD
+ * accumulates and jumps back to the head. */
+struct loop_ctx { struct cstd_alloc a; i32 i, n, cur, sum; };
+enum { L_CHECK, L_LOAD, L_ADD };
+
+static struct cexec_step l_check(void *p) {
+    struct loop_ctx *c = p;
+    u32 next = (c->i <= c->n) ? L_LOAD : cexec_sm_done();
+    return (struct cexec_step){ cexec_future_null(), (void *)0, next };
+}
+static struct cexec_step l_load(void *p) {
+    struct loop_ctx *c = p;
+    return (struct cexec_step){ dv_future(c->a, c->i), &c->cur, L_ADD };
+}
+static struct cexec_step l_add(void *p) {
+    struct loop_ctx *c = p;
+    c->sum += c->cur;
+    c->i   += 1;
+    return (struct cexec_step){ cexec_future_null(), (void *)0, L_CHECK };
+}
+static const cexec_state_fn loop_states[] = { l_check, l_load, l_add };
+
+[[cust::test]] int test_sm_loop(void) {
+    struct cstd_alloc a = cstd_alloc_system();
+    struct cexec_executor ex;
+    cexec_executor_init(&ex, a);
+
+    struct loop_ctx c = { a, 1, 5, 0, 0 };
+    struct cexec_future f = cexec_sm_in(a, &c, loop_states, 3, L_CHECK);
+    cust_assert(cexec_executor_block_on(&ex, f, (void *)0));
+    cust_assert_eq(c.sum, 15); /* 1+2+3+4+5 */
     return 0;
 }
