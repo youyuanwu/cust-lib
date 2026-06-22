@@ -2,40 +2,50 @@
  *
  * The second external wake source, and the one that subsumes
  * the timer reactor. A thread can only block in one place, so
- * timers and I/O cannot each own a `park`: instead the epoll
- * driver IS the parker, and the timer reactor becomes its
- * timeout source. One `epoll_wait` call services both —
- * readiness events wake I/O futures, and the next timer
- * deadline is passed as the wait timeout so sleeps still fire.
- * This is exactly Tokio's layering (scheduler ⟂ time driver ⟂
- * I/O driver, with the time driver's deadline feeding the I/O
- * park).
+ * timers and I/O cannot each own a `park`: the epoll driver IS
+ * the parker, and the timer reactor becomes its timeout source.
+ * One `epoll_wait` services both — readiness events wake I/O
+ * futures, and the next timer deadline is the wait timeout so
+ * sleeps still fire. This is Tokio's layering (scheduler ⟂ time
+ * driver ⟂ I/O driver, the deadline feeding the I/O park).
  *
  *   Rust/Tokio                   cust_execution
  *   -------------------------    ---------------------------
  *   mio::Poll / epoll            cexec_io_driver (epoll fd)
- *   Interest::READABLE           cexec_readable_in (EPOLLIN)
- *   epoll_wait(next_deadline)    io_driver_park
- *   AsyncFd registration         struct io_reg (in the future)
+ *   ScheduledIo (per-fd state)   struct io_sched (per fd)
+ *   Interest READABLE/WRITABLE   cexec_readable_in / writable_in
+ *   AsyncFd::new / drop          cexec_io_add / cexec_io_remove
  *
- * Linux only (epoll) — consistent with cust's Linux-first,
- * clang-only stance.
+ * Per-fd registration: an fd is registered ONCE (cexec_io_add)
+ * and lives until cexec_io_remove. Each fd's `io_sched` holds a
+ * separate read and write waker slot, so a socket can have a
+ * reader and a writer awaiting it *simultaneously* — the model
+ * a single ADD-per-future would break on with EEXIST. The epoll
+ * interest mask is recomputed (EPOLL_CTL_MOD) from the armed
+ * slots, so a level-triggered EPOLLOUT is only watched while a
+ * writer is actually waiting (no busy-spin on always-writable
+ * sockets). Linux only.
  *
  * Readiness discipline: epoll readiness is advisory. A real I/O
- * future must do the non-blocking syscall and retry on EAGAIN;
- * `cexec_readable_in` is the readiness primitive those futures
- * build on (it resolves when the fd is *probably* readable; the
- * caller then performs the actual non-blocking read and re-awaits
- * if it sees EAGAIN). Registrations are one-shot (EPOLLONESHOT)
- * and intrusively embedded in the future, so arming an await
- * costs no extra allocation and the kernel never holds a pointer
- * into freed memory (the future deregisters on drop).
+ * future does the non-blocking syscall and retries on EAGAIN;
+ * `cexec_readable_in` / `cexec_writable_in` are the readiness
+ * primitives those build on. EPOLLERR/EPOLLHUP are reported by
+ * the kernel unconditionally and wake *both* slots, so a writer
+ * blocked on connect() learns of a failed connection.
  *
- * Threading: NONE. A cross-thread waker would need an eventfd
- * registered in the epoll set so a wake from another thread can
- * break an in-progress epoll_wait; single-threaded with only
- * timers + fds, the wait timeout and the fds themselves are the
- * only wake sources, so no eventfd is required yet.
+ * SIGPIPE: writing to a peer-closed socket raises SIGPIPE, which
+ * kills the process by default. The driver ignores it once at
+ * init so a disconnect surfaces as EPIPE on the write instead.
+ *
+ * Threading: NONE. A cross-thread waker would need an eventfd in
+ * the epoll set to break an in-progress epoll_wait; single
+ * threaded, the wait timeout and the fds are the only wake
+ * sources.
+ *
+ * Lifetime: futures hold a raw fd and look up its `io_sched`; an
+ * fd must stay registered (added, not removed/closed) while any
+ * future awaiting it is alive. A single read waiter and a single
+ * write waiter per fd are supported (the common case).
  */
 
 #cust use std;
@@ -45,44 +55,126 @@
 
 #include <stddef.h>
 #include <errno.h>
+#include <signal.h>
 #include <unistd.h>
 #include <sys/epoll.h>
 
 #define IO_MAX_EVENTS 32
 
-/* ─── registration (intrusive in an I/O future) ─────────── */
+/* ─── per-fd registration ───────────────────────────────── */
 
-struct io_reg {
-    struct cexec_waker waker;      /* cloned from the future's poll */
-    int                fd;
-    bool               registered; /* added to the epoll set */
-    bool               fired;      /* epoll reported it; waker consumed */
+struct io_sched {
+    struct std_list_head link;        /* driver's fd table */
+    int                  fd;
+    struct cexec_waker   read_waker;  /* valid iff read_armed */
+    struct cexec_waker   write_waker; /* valid iff write_armed */
+    bool                 read_armed;
+    bool                 write_armed;
 };
+
+#define SCHED_OF(node) \
+    ((struct io_sched *)((u8 *)(node) - offsetof(struct io_sched, link)))
 
 /* ─── driver ────────────────────────────────────────────── */
 
 struct [[cust::pub_repr]] cexec_io_driver {
     struct cstd_alloc    alloc;
-    struct cexec_reactor timers;   /* owned: supplies the epoll timeout */
-    int                  epfd;      /* epoll instance */
-    usize                npending;  /* armed regs not yet fired */
+    struct cexec_reactor timers;  /* owned: supplies the epoll timeout */
+    struct std_list_head fds;     /* registered io_sched list */
+    int                  epfd;     /* epoll instance */
+    usize                armed;    /* total armed slots across all fds */
 };
 
-/* Create the epoll instance and an embedded real-clock timer
- * reactor. Returns false if epoll_create1 fails. */
 [[cust::pub]] bool cexec_io_driver_init(struct cexec_io_driver *d,
                                         struct cstd_alloc a) {
+    /* Never die on a write to a closed peer — see EPIPE instead. */
+    signal(SIGPIPE, SIG_IGN);
     d->epfd = epoll_create1(EPOLL_CLOEXEC);
     if (d->epfd < 0) {
         return false;
     }
-    d->alloc    = a;
-    d->npending = 0;
+    d->alloc = a;
+    d->armed = 0;
+    std_list_init(&d->fds);
     cexec_reactor_init(&d->timers, a, cexec_clock_system());
     return true;
 }
 
+static struct io_sched *find_sched(struct cexec_io_driver *d, int fd) {
+    for (struct std_list_head *p = d->fds.next; p != &d->fds; p = p->next) {
+        struct io_sched *s = SCHED_OF(p);
+        if (s->fd == fd) {
+            return s;
+        }
+    }
+    return (void *)0;
+}
+
+/* Recompute the epoll interest mask from the armed slots so we
+ * only watch a direction while a future is waiting on it. */
+static void sched_update_interest(struct cexec_io_driver *d,
+                                  struct io_sched *s) {
+    struct epoll_event ev;
+    ev.events   = (s->read_armed ? (u32)EPOLLIN : 0u)
+                | (s->write_armed ? (u32)EPOLLOUT : 0u);
+    ev.data.ptr = s;
+    epoll_ctl(d->epfd, EPOLL_CTL_MOD, s->fd, &ev);
+}
+
+/* Register `fd` (idempotent). Must be called before awaiting
+ * readability/writability on it, and balanced by
+ * cexec_io_remove before the fd is closed. */
+[[cust::pub]] bool cexec_io_add(struct cexec_io_driver *d, int fd) {
+    if (find_sched(d, fd)) {
+        return true;
+    }
+    struct io_sched *s = cstd_alloc_allocate(d->alloc, sizeof *s,
+                                             _Alignof(struct io_sched));
+    if (!s) {
+        return false;
+    }
+    s->fd          = fd;
+    s->read_armed  = false;
+    s->write_armed = false;
+    struct epoll_event ev;
+    ev.events   = 0; /* no interest until a future arms a slot */
+    ev.data.ptr = s;
+    if (epoll_ctl(d->epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
+        cstd_alloc_deallocate(d->alloc, s, sizeof *s,
+                              _Alignof(struct io_sched));
+        return false;
+    }
+    std_list_add_tail(&s->link, &d->fds);
+    return true;
+}
+
+static void sched_free(struct cexec_io_driver *d, struct io_sched *s) {
+    epoll_ctl(d->epfd, EPOLL_CTL_DEL, s->fd, (void *)0);
+    if (s->read_armed) {
+        d->armed--;
+        cexec_waker_drop(s->read_waker);
+    }
+    if (s->write_armed) {
+        d->armed--;
+        cexec_waker_drop(s->write_waker);
+    }
+    std_list_del(&s->link);
+    cstd_alloc_deallocate(d->alloc, s, sizeof *s, _Alignof(struct io_sched));
+}
+
+/* Deregister `fd` and release any waiting waker clones. Call
+ * before closing the fd. */
+[[cust::pub]] void cexec_io_remove(struct cexec_io_driver *d, int fd) {
+    struct io_sched *s = find_sched(d, fd);
+    if (s) {
+        sched_free(d, s);
+    }
+}
+
 [[cust::pub]] void cexec_io_driver_close(struct cexec_io_driver *d) {
+    while (!std_list_is_empty(&d->fds)) {
+        sched_free(d, SCHED_OF(d->fds.next));
+    }
     if (d->epfd >= 0) {
         close(d->epfd);
         d->epfd = -1;
@@ -96,14 +188,14 @@ cexec_io_driver_reactor(struct cexec_io_driver *d) {
     return &d->timers;
 }
 
-/* The unified park: block in one epoll_wait whose timeout is
- * the next timer deadline, then fire ready fds and due timers. */
+/* The unified park: block in one epoll_wait whose timeout is the
+ * next timer deadline, then wake ready fds and fire due timers. */
 static bool io_driver_park(void *state) {
     struct cexec_io_driver *d = state;
 
     u64 deadline;
     bool have_timer = cexec_reactor_earliest(&d->timers, &deadline);
-    if (!have_timer && d->npending == 0) {
+    if (!have_timer && d->armed == 0) {
         return false; /* no fds, no timers: nothing can wake us */
     }
 
@@ -126,13 +218,23 @@ static bool io_driver_park(void *state) {
 
     bool progressed = false;
     for (int i = 0; i < n; i++) {
-        struct io_reg *reg = evs[i].data.ptr;
-        if (!reg->fired) {
-            reg->fired = true;
-            d->npending--;
-            cexec_waker_wake(reg->waker); /* consumes the clone */
+        struct io_sched *s = evs[i].data.ptr;
+        u32 e = evs[i].events;
+        bool err = (e & ((u32)EPOLLERR | (u32)EPOLLHUP)) != 0;
+
+        if (s->read_armed && (((e & (u32)EPOLLIN) != 0) || err)) {
+            s->read_armed = false;
+            d->armed--;
+            cexec_waker_wake(s->read_waker); /* consumes the clone */
             progressed = true;
         }
+        if (s->write_armed && (((e & (u32)EPOLLOUT) != 0) || err)) {
+            s->write_armed = false;
+            d->armed--;
+            cexec_waker_wake(s->write_waker);
+            progressed = true;
+        }
+        sched_update_interest(d, s); /* drop the just-fired directions */
     }
     if (have_timer) {
         if (cexec_reactor_fire_due(&d->timers, cexec_reactor_now(&d->timers))) {
@@ -150,78 +252,101 @@ cexec_io_driver_as_park(struct cexec_io_driver *d) {
     return p;
 }
 
-/* ─── readable(fd) future ───────────────────────────────── */
+/* ─── readable/writable(fd) futures ─────────────────────── */
 
-struct readable_box {
+struct interest_box {
     struct cstd_alloc       alloc;
     struct cexec_io_driver *driver;
-    struct io_reg           reg;
+    int                     fd;
+    bool                    want_write; /* false = read */
+    bool                    armed;      /* this future set its slot */
 };
 
-static cexec_poll readable_poll(void *self, struct cexec_waker w, void *out) {
+static cexec_poll interest_poll(void *self, struct cexec_waker w, void *out) {
     (void)out;
-    struct readable_box *b = self;
+    struct interest_box *b = self;
+    struct io_sched *s = find_sched(b->driver, b->fd);
+    if (!s) {
+        /* fd not registered: resolve so the caller does the real
+         * syscall and observes the error itself. */
+        return cexec_poll_ready();
+    }
+    bool *armed = b->want_write ? &s->write_armed : &s->read_armed;
+    struct cexec_waker *slot = b->want_write ? &s->write_waker : &s->read_waker;
 
-    if (!b->reg.registered) {
-        b->reg.waker = cexec_waker_clone(w);
-        b->reg.fired = false;
-        struct epoll_event ev;
-        ev.events   = EPOLLIN | EPOLLONESHOT;
-        ev.data.ptr = &b->reg;
-        if (epoll_ctl(b->driver->epfd, EPOLL_CTL_ADD, b->reg.fd, &ev) != 0) {
-            /* Cannot watch this fd (closed/invalid): drop the
-             * clone and resolve so the caller proceeds to the
-             * real read and observes the error itself. */
-            cexec_waker_drop(b->reg.waker);
-            return cexec_poll_ready();
-        }
-        b->reg.registered = true;
-        b->driver->npending++;
+    if (!b->armed) {
+        *slot  = cexec_waker_clone(w);
+        *armed = true;
+        b->driver->armed++;
+        sched_update_interest(b->driver, s);
+        b->armed = true;
         return cexec_poll_pending();
     }
-
-    return b->reg.fired ? cexec_poll_ready() : cexec_poll_pending();
+    /* The park clears the slot's armed flag when it fires it. */
+    return *armed ? cexec_poll_pending() : cexec_poll_ready();
 }
 
-static void readable_drop(void *self) {
-    struct readable_box *b = self;
-    if (b->reg.registered) {
-        /* Remove from the epoll set first so the kernel never
-         * holds a data.ptr into this soon-to-be-freed box. */
-        epoll_ctl(b->driver->epfd, EPOLL_CTL_DEL, b->reg.fd, (void *)0);
-        if (!b->reg.fired) {
-            b->driver->npending--;
-            cexec_waker_drop(b->reg.waker);
+static void interest_drop(void *self) {
+    struct interest_box *b = self;
+    if (b->armed) {
+        struct io_sched *s = find_sched(b->driver, b->fd);
+        if (s) {
+            bool *armed = b->want_write ? &s->write_armed : &s->read_armed;
+            if (*armed) {
+                /* dropped before firing (e.g. a select loser) —
+                 * cancel our slot and stop watching it. */
+                struct cexec_waker *slot =
+                    b->want_write ? &s->write_waker : &s->read_waker;
+                *armed = false;
+                b->driver->armed--;
+                cexec_waker_drop(*slot);
+                sched_update_interest(b->driver, s);
+            }
         }
     }
-    cstd_alloc_deallocate(b->alloc, b, sizeof *b, _Alignof(struct readable_box));
+    cstd_alloc_deallocate(b->alloc, b, sizeof *b, _Alignof(struct interest_box));
 }
 
-static const struct cexec_future_vtable readable_vtable = {
-    .poll = readable_poll,
-    .drop = readable_drop,
+static const struct cexec_future_vtable interest_vtable = {
+    .poll = interest_poll,
+    .drop = interest_drop,
 };
 
-/* A future that resolves when `fd` is readable (EPOLLIN). Unit
- * output — the caller performs the actual non-blocking read and
- * re-awaits on EAGAIN. Returns the null future on OOM. */
-[[cust::pub]] struct cexec_future cexec_readable_in(struct cstd_alloc a,
-                                                    struct cexec_io_driver *d,
-                                                    int fd) {
+static struct cexec_future interest_new(struct cstd_alloc a,
+                                        struct cexec_io_driver *d,
+                                        int fd, bool want_write) {
     struct cexec_future f = {(void *)0, (void *)0};
-    struct readable_box *b = cstd_alloc_allocate(a, sizeof *b,
-                                                 _Alignof(struct readable_box));
+    struct interest_box *b = cstd_alloc_allocate(a, sizeof *b,
+                                                 _Alignof(struct interest_box));
     if (!b) {
         return f;
     }
-    b->alloc          = a;
-    b->driver         = d;
-    b->reg.fd         = fd;
-    b->reg.registered = false;
-    b->reg.fired      = false;
-    f.self            = b;
-    f.vtable          = &readable_vtable;
+    b->alloc      = a;
+    b->driver     = d;
+    b->fd         = fd;
+    b->want_write = want_write;
+    b->armed      = false;
+    f.self        = b;
+    f.vtable      = &interest_vtable;
     return f;
+}
+
+/* Resolve when `fd` is readable (EPOLLIN, or err/hup). `fd` must
+ * be registered via cexec_io_add. Unit output — the caller does
+ * the real non-blocking read and re-awaits on EAGAIN. */
+[[cust::pub]] struct cexec_future cexec_readable_in(struct cstd_alloc a,
+                                                    struct cexec_io_driver *d,
+                                                    int fd) {
+    return interest_new(a, d, fd, false);
+}
+
+/* Resolve when `fd` is writable (EPOLLOUT, or err/hup) — also
+ * how a non-blocking connect() completes. `fd` must be
+ * registered via cexec_io_add. Unit output. */
+[[cust::pub]] struct cexec_future cexec_writable_in(struct cstd_alloc a,
+                                                    struct cexec_io_driver *d,
+                                                    int fd) {
+    return interest_new(a, d, fd, true);
 }
 
 /* ─── unit tests ────────────────────────────────────────── */
@@ -229,11 +354,12 @@ static const struct cexec_future_vtable readable_vtable = {
 #cust use crate::combinators;
 
 #include <fcntl.h>
+#include <sys/socket.h>
 
 #define MS 1000000ull
 
-/* A waker that does nothing — enough to arm a registration in a
- * test that never lets the driver fire. */
+/* A waker that does nothing — enough to arm a slot in a test
+ * that never lets the driver fire. */
 static void io_noop_wake(void *d) { (void)d; }
 static struct cexec_waker io_noop_waker(void);
 static struct cexec_waker io_noop_clone(void *d) { (void)d; return io_noop_waker(); }
@@ -253,14 +379,18 @@ static struct cexec_waker io_noop_waker(void) {
     return w;
 }
 
+static void set_nonblock(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
 /* Build a non-blocking pipe; returns false on failure. */
 static bool make_pipe(int *rfd, int *wfd) {
     int fds[2];
     if (pipe(fds) != 0) {
         return false;
     }
-    int fl = fcntl(fds[0], F_GETFL, 0);
-    fcntl(fds[0], F_SETFL, fl | O_NONBLOCK);
+    set_nonblock(fds[0]);
     *rfd = fds[0];
     *wfd = fds[1];
     return true;
@@ -276,6 +406,7 @@ static bool make_pipe(int *rfd, int *wfd) {
 
     int rfd, wfd;
     cust_assert(make_pipe(&rfd, &wfd));
+    cust_assert(cexec_io_add(&io, rfd));
 
     /* Make the read end ready before we block (single thread). */
     cust_assert(write(wfd, "x", 1) == 1);
@@ -288,8 +419,68 @@ static bool make_pipe(int *rfd, int *wfd) {
     cust_assert(read(rfd, &buf, 1) == 1);
     cust_assert(buf == 'x');
 
+    cexec_io_remove(&io, rfd);
     close(rfd);
     close(wfd);
+    cexec_io_driver_close(&io);
+    return 0;
+}
+
+[[cust::test]] int test_writable_ready_immediately(void) {
+    struct cstd_alloc a = cstd_alloc_system();
+    struct cexec_io_driver io;
+    cust_assert(cexec_io_driver_init(&io, a));
+    struct cexec_executor ex;
+    cexec_executor_init(&ex, a);
+    cexec_executor_set_park(&ex, cexec_io_driver_as_park(&io));
+
+    int sv[2];
+    cust_assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    set_nonblock(sv[0]);
+    cust_assert(cexec_io_add(&io, sv[0]));
+
+    /* A fresh socket has empty send buffers → writable at once. */
+    cust_assert(cexec_executor_block_on(&ex, cexec_writable_in(a, &io, sv[0]),
+                                        (void *)0));
+
+    cexec_io_remove(&io, sv[0]);
+    close(sv[0]);
+    close(sv[1]);
+    cexec_io_driver_close(&io);
+    return 0;
+}
+
+[[cust::test]] int test_full_duplex_same_fd(void) {
+    struct cstd_alloc a = cstd_alloc_system();
+    struct cexec_io_driver io;
+    cust_assert(cexec_io_driver_init(&io, a));
+    struct cexec_executor ex;
+    cexec_executor_init(&ex, a);
+    cexec_executor_set_park(&ex, cexec_io_driver_as_park(&io));
+
+    int sv[2];
+    cust_assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    set_nonblock(sv[0]);
+    set_nonblock(sv[1]);
+    cust_assert(cexec_io_add(&io, sv[0]));
+
+    /* Make sv[0] readable too, then await BOTH readable and
+     * writable on the SAME fd at once — two slots on one
+     * registration, which the per-future ADD model could not do
+     * (EEXIST). */
+    cust_assert(write(sv[1], "z", 1) == 1);
+    struct cexec_future f =
+        cexec_join2_in(a, cexec_readable_in(a, &io, sv[0]), 0,
+                       cexec_writable_in(a, &io, sv[0]));
+    cust_assert(cexec_executor_block_on(&ex, f, (void *)0));
+
+    char buf = 0;
+    cust_assert(read(sv[0], &buf, 1) == 1);
+    cust_assert(buf == 'z');
+
+    cexec_io_remove(&io, sv[0]);
+    close(sv[0]);
+    close(sv[1]);
     cexec_io_driver_close(&io);
     return 0;
 }
@@ -326,6 +517,7 @@ static bool make_pipe(int *rfd, int *wfd) {
 
     int rfd, wfd;
     cust_assert(make_pipe(&rfd, &wfd));
+    cust_assert(cexec_io_add(&io, rfd));
     cust_assert(write(wfd, "y", 1) == 1);
 
     /* One executor, one epoll_wait loop, servicing both a
@@ -339,6 +531,7 @@ static bool make_pipe(int *rfd, int *wfd) {
     cust_assert(read(rfd, &buf, 1) == 1);
     cust_assert(buf == 'y');
 
+    cexec_io_remove(&io, rfd);
     close(rfd);
     close(wfd);
     cexec_io_driver_close(&io);
@@ -352,17 +545,19 @@ static bool make_pipe(int *rfd, int *wfd) {
 
     int rfd, wfd;
     cust_assert(make_pipe(&rfd, &wfd));
+    cust_assert(cexec_io_add(&io, rfd));
+
     /* No data written: the fd never becomes readable. Arm a
      * readable future by polling once, then drop it; the driver
-     * must end with no pending registrations. */
+     * must end with no armed slots. */
     struct cexec_future f = cexec_readable_in(a, &io, rfd);
-
     cexec_poll st = cexec_future_poll(f, io_noop_waker(), (void *)0);
     cust_assert(!cexec_poll_is_ready(st));
-    cust_assert(io.npending == 1);
+    cust_assert(io.armed == 1);
     cexec_future_drop(f);
-    cust_assert(io.npending == 0);
+    cust_assert(io.armed == 0);
 
+    cexec_io_remove(&io, rfd);
     close(rfd);
     close(wfd);
     cexec_io_driver_close(&io);
