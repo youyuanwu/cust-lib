@@ -20,6 +20,13 @@
  *   src/io.c        — cexec_io_driver: epoll readiness driver +
  *                     readable future; unifies timers + I/O in
  *                     one epoll_wait (a `park` impl)
+ *   src/fd.c        — cexec_fd: owned, registered fd handle
+ *                     (adopt/close + readable/writable futures)
+ *   src/stream.c    — cexec_stream / cexec_listener: family-
+ *                     agnostic async stream sockets (read/write/
+ *                     write_all/accept/connect)
+ *   src/tcp.c       — cexec_tcp_listen / connect: IPv4 address
+ *                     shim over the stream core
  *   src/runtime.c   — cexec_runtime: executor + reactor bundled
  *                     (the batteries-included default)
  *
@@ -40,6 +47,9 @@
 #cust mod combinators;
 #cust mod reactor;
 #cust mod io;
+#cust mod fd;
+#cust mod stream;
+#cust mod tcp;
 #cust mod runtime;
 
 /* The cust_execution major/minor/patch this crate was authored
